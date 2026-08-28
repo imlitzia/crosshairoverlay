@@ -1,238 +1,550 @@
-import json, os, sys, tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+import json
+import os
+import sys
 
-CONFIG_FILE = "crosshair_config.json"
+from PySide6.QtCore import Qt, QPoint
+from PySide6.QtGui import QPixmap, QPainter, QImage
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QFileDialog,
+    QVBoxLayout, QHBoxLayout, QSlider, QScrollArea, QMessageBox,
+    QFrame
+)
 
-class CrosshairApp:
+CONFIG_FILE = "crosshair_qt_config.json"
+
+
+class ImagePickerLabel(QLabel):
+    def __init__(self, parent_app):
+        super().__init__()
+        self.parent_app = parent_app
+        self.setFixedSize(520, 360)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background:#202020; border:1px solid #666;")
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+
+        if self.parent_app.original_image is None:
+            return
+
+        pixmap = self.pixmap()
+        if pixmap is None:
+            return
+
+        # Displayed pixmap is centered in this QLabel.
+        px = int((self.width() - pixmap.width()) / 2)
+        py = int((self.height() - pixmap.height()) / 2)
+
+        local_x = event.position().x() - px
+        local_y = event.position().y() - py
+
+        if not (0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height()):
+            return
+
+        original = self.parent_app.original_image
+
+        scale_x = original.width() / pixmap.width()
+        scale_y = original.height() / pixmap.height()
+
+        self.parent_app.mid_x = local_x * scale_x
+        self.parent_app.mid_y = local_y * scale_y
+
+        self.parent_app.update_preview()
+        self.parent_app.update_status()
+        self.parent_app.save_config()
+        self.parent_app.refresh_overlay()
+
+
+class CalibrationWindow(QWidget):
+    def __init__(self, parent_app):
+        super().__init__(None)
+        self.parent_app = parent_app
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        screen = QApplication.primaryScreen()
+        self.setGeometry(screen.geometry())
+
+        self.setCursor(Qt.CrossCursor)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+        painter.setOpacity(0.65)
+        painter.setPen(Qt.white)
+
+    def mousePressEvent(self, event):
+        global_pos = event.globalPosition()
+
+        self.parent_app.screen_x = int(global_pos.x())
+        self.parent_app.screen_y = int(global_pos.y())
+
+        self.close()
+        self.parent_app.update_status()
+        self.parent_app.save_config()
+        self.parent_app.show_overlay()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+class OverlayWindow(QWidget):
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Custom Image Crosshair")
-        self.root.geometry("650x760")
-        self.root.minsize(520, 500)
-        self.root.resizable(True, True)
+        super().__init__(None)
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+        )
+
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        self.pixmap = None
+        self.opacity_value = 1.0
+
+    def set_overlay_pixmap(self, pixmap, opacity):
+        self.pixmap = pixmap
+        self.opacity_value = opacity
+        self.resize(pixmap.size())
+        self.update()
+
+    def paintEvent(self, event):
+        if self.pixmap is None:
+            return
+
+        painter = QPainter(self)
+
+        # High quality composition with true per-pixel alpha.
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setOpacity(self.opacity_value)
+        painter.drawPixmap(0, 0, self.pixmap)
+
+
+class CrosshairApp(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Custom Image Crosshair - HQ Qt")
+        self.resize(760, 820)
+        self.setMinimumSize(600, 540)
 
         self.image_path = None
         self.original_image = None
-        self.preview_image = None
-        self.preview_photo = None
-        self.mid_x = self.mid_y = None
-        self.screen_x = self.screen_y = None
-        self.overlay = None
-        self.overlay_photo = None
-        self.scale = tk.DoubleVar(value=0.25)
-        self.opacity = tk.DoubleVar(value=1.0)
+
+        self.mid_x = None
+        self.mid_y = None
+
+        self.screen_x = None
+        self.screen_y = None
+
+        self.scale_value = 1.0
+        self.opacity_value = 1.0
+
+        self.overlay = OverlayWindow()
+        self.calibration_window = None
 
         self.load_config()
         self.build_ui()
+
         if self.image_path and os.path.exists(self.image_path):
-            try:
-                self.load_image(self.image_path)
-            except Exception:
-                pass
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+            self.load_image(self.image_path)
 
     def build_ui(self):
-        outer = tk.Frame(self.root)
-        outer.pack(fill="both", expand=True)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
 
-        self.scroll_canvas = tk.Canvas(outer, highlightthickness=0)
-        bar = tk.Scrollbar(outer, orient="vertical", command=self.scroll_canvas.yview)
-        self.scroll_canvas.configure(yscrollcommand=bar.set)
-        bar.pack(side="right", fill="y")
-        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 20, 24, 30)
+        layout.setSpacing(12)
 
-        self.content = tk.Frame(self.scroll_canvas)
-        self.content_id = self.scroll_canvas.create_window((0, 0), window=self.content, anchor="nw")
-        self.content.bind("<Configure>", lambda e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")))
-        self.scroll_canvas.bind("<Configure>", lambda e: self.scroll_canvas.itemconfigure(self.content_id, width=e.width))
-        self.root.bind_all("<MouseWheel>", self.mousewheel)
+        title = QLabel("Custom Image Crosshair — HQ")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size:24px; font-weight:700;")
+        layout.addWidget(title)
 
-        tk.Label(self.content, text="Custom Image Crosshair", font=("Segoe UI", 20, "bold")).pack(pady=(18, 8))
-        tk.Label(self.content, justify="left", font=("Segoe UI", 10), text=(
-            "1. Load an image\n"
-            "2. Click the point inside the image that should be the crosshair center\n"
-            "3. Press Center on Screen for an exact monitor-center target\n"
-            "4. Show the overlay"
-        )).pack(padx=25, pady=8, anchor="w")
+        info = QLabel(
+            "1. Load a PNG/image\n"
+            "2. Click the exact aiming point inside the image\n"
+            "3. Press Center on Screen\n"
+            "4. Show the overlay\n\n"
+            "This version uses real per-pixel transparency instead of color-key transparency."
+        )
+        info.setStyleSheet("font-size:13px;")
+        layout.addWidget(info)
 
-        tk.Button(self.content, text="Choose Crosshair Image", command=self.choose_image, width=30, height=2).pack(pady=10)
+        choose = QPushButton("Choose Crosshair Image")
+        choose.setMinimumHeight(42)
+        choose.clicked.connect(self.choose_image)
+        layout.addWidget(choose)
 
-        self.image_canvas = tk.Canvas(self.content, width=440, height=320, bg="#222222", highlightthickness=1,
-                                      highlightbackground="#666666", cursor="crosshair")
-        self.image_canvas.pack(pady=10)
-        self.image_canvas.bind("<Button-1>", self.set_image_midpoint)
+        self.preview = ImagePickerLabel(self)
+        layout.addWidget(self.preview, alignment=Qt.AlignCenter)
 
-        self.status = tk.Label(self.content, text="Load an image to begin.", font=("Segoe UI", 10),
-                               wraplength=560, justify="left")
-        self.status.pack(padx=25, pady=8, anchor="w")
+        self.status = QLabel("Load an image to begin.")
+        self.status.setStyleSheet("font-size:13px;")
+        layout.addWidget(self.status)
 
-        controls = tk.Frame(self.content)
-        controls.pack(fill="x", padx=25, pady=8)
-        tk.Label(controls, text="Overlay scale:").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        tk.Scale(controls, from_=0.05, to=3.0, resolution=0.05, orient="horizontal", variable=self.scale,
-                 command=lambda _: self.refresh_overlay()).grid(row=0, column=1, sticky="ew")
-        tk.Label(controls, text="Opacity:").grid(row=1, column=0, sticky="w", padx=(0, 10))
-        tk.Scale(controls, from_=0.1, to=1.0, resolution=0.05, orient="horizontal", variable=self.opacity,
-                 command=lambda _: self.refresh_overlay()).grid(row=1, column=1, sticky="ew")
-        controls.columnconfigure(1, weight=1)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        layout.addWidget(line)
 
-        tk.Label(self.content, text="Screen Position", font=("Segoe UI", 12, "bold")).pack(pady=(15, 6))
-        pos = tk.Frame(self.content); pos.pack(pady=5)
-        tk.Button(pos, text="Center on Screen", command=self.center_on_screen, width=22, height=2).grid(row=0, column=0, padx=6)
-        tk.Button(pos, text="Manual Calibration", command=self.manual_calibration, width=22, height=2).grid(row=0, column=1, padx=6)
+        scale_text = QLabel("Overlay scale")
+        scale_text.setStyleSheet("font-weight:600;")
+        layout.addWidget(scale_text)
 
-        buttons = tk.Frame(self.content); buttons.pack(pady=12)
-        tk.Button(buttons, text="Show Overlay", command=self.show_overlay, width=20, height=2).grid(row=0, column=0, padx=6)
-        tk.Button(buttons, text="Hide Overlay", command=self.hide_overlay, width=20, height=2).grid(row=0, column=1, padx=6)
+        scale_row = QHBoxLayout()
 
-        tk.Label(self.content, fg="#555555", font=("Segoe UI", 9), justify="center",
-                 text="Normal FPS use: select the aiming point inside the image, then press Center on Screen.").pack(pady=(8, 3))
-        tk.Label(self.content, fg="#666666", font=("Segoe UI", 9),
-                 text="PNG images with transparent backgrounds work best.").pack(pady=(0, 25))
+        self.scale_slider = QSlider(Qt.Horizontal)
+        self.scale_slider.setRange(5, 300)
+        self.scale_slider.setValue(int(self.scale_value * 100))
+        self.scale_slider.valueChanged.connect(self.scale_changed)
 
-    def mousewheel(self, event):
-        self.scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+        self.scale_label = QLabel(f"{self.scale_value:.2f}×")
+        self.scale_label.setMinimumWidth(60)
+
+        scale_row.addWidget(self.scale_slider)
+        scale_row.addWidget(self.scale_label)
+        layout.addLayout(scale_row)
+
+        pixel_btn = QPushButton("Pixel-Perfect 1:1")
+        pixel_btn.clicked.connect(self.pixel_perfect)
+        layout.addWidget(pixel_btn)
+
+        quality_note = QLabel(
+            "1.00× = exact source pixels, with no resizing.\n"
+            "Below 1.00× = image is downscaled, but Qt uses high-quality filtering."
+        )
+        quality_note.setStyleSheet("color:#666;")
+        layout.addWidget(quality_note)
+
+        opacity_text = QLabel("Opacity")
+        opacity_text.setStyleSheet("font-weight:600;")
+        layout.addWidget(opacity_text)
+
+        opacity_row = QHBoxLayout()
+
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(10, 100)
+        self.opacity_slider.setValue(int(self.opacity_value * 100))
+        self.opacity_slider.valueChanged.connect(self.opacity_changed)
+
+        self.opacity_label = QLabel(f"{self.opacity_value:.2f}")
+        self.opacity_label.setMinimumWidth(60)
+
+        opacity_row.addWidget(self.opacity_slider)
+        opacity_row.addWidget(self.opacity_label)
+        layout.addLayout(opacity_row)
+
+        position_title = QLabel("Screen Position")
+        position_title.setStyleSheet("font-size:15px; font-weight:700;")
+        layout.addWidget(position_title)
+
+        position_row = QHBoxLayout()
+
+        center_btn = QPushButton("Center on Screen")
+        center_btn.setMinimumHeight(42)
+        center_btn.clicked.connect(self.center_on_screen)
+
+        manual_btn = QPushButton("Manual Calibration")
+        manual_btn.setMinimumHeight(42)
+        manual_btn.clicked.connect(self.manual_calibration)
+
+        position_row.addWidget(center_btn)
+        position_row.addWidget(manual_btn)
+        layout.addLayout(position_row)
+
+        overlay_row = QHBoxLayout()
+
+        show_btn = QPushButton("Show Overlay")
+        show_btn.setMinimumHeight(42)
+        show_btn.clicked.connect(self.show_overlay)
+
+        hide_btn = QPushButton("Hide Overlay")
+        hide_btn.setMinimumHeight(42)
+        hide_btn.clicked.connect(self.hide_overlay)
+
+        overlay_row.addWidget(show_btn)
+        overlay_row.addWidget(hide_btn)
+        layout.addLayout(overlay_row)
+
+        tip = QLabel(
+            "Best quality: use a transparent PNG and keep scale at 1.00×.\n"
+            "If you want the character smaller without losing edge quality, use a large original PNG."
+        )
+        tip.setStyleSheet("color:#555;")
+        layout.addWidget(tip)
+
+        layout.addStretch()
+
+        scroll.setWidget(body)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(scroll)
+
+        self.update_status()
 
     def choose_image(self):
-        path = filedialog.askopenfilename(title="Choose crosshair image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
-        if not path: return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Crosshair Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+
+        if not path:
+            return
+
         self.image_path = path
-        self.mid_x = self.mid_y = None
+        self.mid_x = None
+        self.mid_y = None
+
         self.load_image(path)
         self.save_config()
 
     def load_image(self, path):
-        self.original_image = Image.open(path).convert("RGBA")
-        self.preview_image = self.original_image.copy()
-        self.preview_image.thumbnail((420, 300), Image.Resampling.LANCZOS)
-        self.preview_photo = ImageTk.PhotoImage(self.preview_image)
-        self.image_canvas.delete("all")
-        self.preview_left = (440 - self.preview_image.width) // 2
-        self.preview_top = (320 - self.preview_image.height) // 2
-        self.image_canvas.create_image(self.preview_left, self.preview_top, anchor="nw", image=self.preview_photo)
-        if self.mid_x is not None: self.draw_midpoint()
+        image = QImage(path)
+
+        if image.isNull():
+            QMessageBox.critical(self, "Error", "Could not load the selected image.")
+            return
+
+        # Preserve the original ARGB pixels, including alpha.
+        self.original_image = image.convertToFormat(QImage.Format_ARGB32)
+
+        self.update_preview()
         self.update_status()
 
-    def set_image_midpoint(self, event):
+    def update_preview(self):
         if self.original_image is None:
-            messagebox.showinfo("No image", "Choose an image first."); return
-        px, py = event.x - self.preview_left, event.y - self.preview_top
-        if not (0 <= px < self.preview_image.width and 0 <= py < self.preview_image.height): return
-        self.mid_x = px * self.original_image.width / self.preview_image.width
-        self.mid_y = py * self.original_image.height / self.preview_image.height
-        self.draw_midpoint(); self.update_status(); self.save_config(); self.refresh_overlay()
+            return
 
-    def draw_midpoint(self):
-        self.image_canvas.delete("midpoint")
-        x = self.preview_left + self.mid_x * self.preview_image.width / self.original_image.width
-        y = self.preview_top + self.mid_y * self.preview_image.height / self.original_image.height
-        r = 9
-        self.image_canvas.create_oval(x-r, y-r, x+r, y+r, outline="#ff3333", width=2, tags="midpoint")
-        self.image_canvas.create_line(x-r-7, y, x+r+7, y, fill="#ff3333", width=2, tags="midpoint")
-        self.image_canvas.create_line(x, y-r-7, x, y+r+7, fill="#ff3333", width=2, tags="midpoint")
+        preview_pixmap = QPixmap.fromImage(self.original_image)
 
-    def validate_ready(self):
-        if self.original_image is None:
-            messagebox.showinfo("No image", "Choose an image first."); return False
-        if self.mid_x is None:
-            messagebox.showinfo("Set midpoint", "Click the desired aiming point inside the image first."); return False
-        return True
+        preview_pixmap = preview_pixmap.scaled(
+            500,
+            340,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+
+        if self.mid_x is not None and self.mid_y is not None:
+            marked = QPixmap(preview_pixmap)
+            painter = QPainter(marked)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            scale_x = preview_pixmap.width() / self.original_image.width()
+            scale_y = preview_pixmap.height() / self.original_image.height()
+
+            x = self.mid_x * scale_x
+            y = self.mid_y * scale_y
+
+            pen = painter.pen()
+            pen.setColor(Qt.red)
+            pen.setWidth(2)
+            painter.setPen(pen)
+
+            r = 10
+            painter.drawEllipse(QPoint(int(x), int(y)), r, r)
+            painter.drawLine(int(x - 18), int(y), int(x + 18), int(y))
+            painter.drawLine(int(x), int(y - 18), int(x), int(y + 18))
+            painter.end()
+
+            preview_pixmap = marked
+
+        self.preview.setPixmap(preview_pixmap)
+
+    def scale_changed(self, value):
+        self.scale_value = value / 100.0
+        self.scale_label.setText(f"{self.scale_value:.2f}×")
+        self.refresh_overlay()
+        self.save_config()
+
+    def opacity_changed(self, value):
+        self.opacity_value = value / 100.0
+        self.opacity_label.setText(f"{self.opacity_value:.2f}")
+        self.refresh_overlay()
+        self.save_config()
+
+    def pixel_perfect(self):
+        self.scale_value = 1.0
+        self.scale_slider.setValue(100)
+        self.refresh_overlay()
+        self.save_config()
 
     def center_on_screen(self):
-        if not self.validate_ready(): return
-        # Exact center of the primary display.
-        self.root.update_idletasks()
-        self.screen_x = self.root.winfo_screenwidth() // 2
-        self.screen_y = self.root.winfo_screenheight() // 2
-        self.update_status(); self.save_config(); self.show_overlay()
+        if not self.ready_for_position():
+            return
+
+        screen = QApplication.primaryScreen().geometry()
+
+        self.screen_x = screen.x() + screen.width() // 2
+        self.screen_y = screen.y() + screen.height() // 2
+
+        self.update_status()
+        self.save_config()
+        self.show_overlay()
 
     def manual_calibration(self):
-        if not self.validate_ready(): return
+        if not self.ready_for_position():
+            return
+
         self.hide_overlay()
-        cal = tk.Toplevel(self.root)
-        cal.attributes("-fullscreen", True); cal.attributes("-topmost", True); cal.attributes("-alpha", 0.30)
-        cal.configure(bg="black", cursor="crosshair")
-        tk.Label(cal, text="CLICK where the selected image midpoint should appear\n\nPress ESC to cancel",
-                 bg="black", fg="white", font=("Segoe UI", 18, "bold")).place(relx=.5, rely=.12, anchor="center")
-        def clicked(e):
-            self.screen_x, self.screen_y = e.x_root, e.y_root
-            cal.destroy(); self.update_status(); self.save_config(); self.show_overlay()
-        cal.bind("<Button-1>", clicked); cal.bind("<Escape>", lambda e: cal.destroy()); cal.focus_force()
+
+        self.calibration_window = CalibrationWindow(self)
+        self.calibration_window.showFullScreen()
+        self.calibration_window.activateWindow()
+
+    def ready_for_position(self):
+        if self.original_image is None:
+            QMessageBox.information(self, "No image", "Choose an image first.")
+            return False
+
+        if self.mid_x is None or self.mid_y is None:
+            QMessageBox.information(
+                self,
+                "Set midpoint",
+                "Click the desired aiming point inside the image first."
+            )
+            return False
+
+        return True
 
     def show_overlay(self):
-        if not self.validate_ready(): return
-        if self.screen_x is None:
-            self.screen_x = self.root.winfo_screenwidth() // 2
-            self.screen_y = self.root.winfo_screenheight() // 2
-        if self.overlay is None or not self.overlay.winfo_exists():
-            self.overlay = tk.Toplevel(self.root)
-            self.overlay.overrideredirect(True); self.overlay.attributes("-topmost", True)
-            self.transparent_color = "#010101"
-            self.overlay.configure(bg=self.transparent_color)
-            try: self.overlay.wm_attributes("-transparentcolor", self.transparent_color)
-            except tk.TclError: pass
-            self.overlay_label = tk.Label(self.overlay, bg=self.transparent_color, borderwidth=0, highlightthickness=0)
-            self.overlay_label.pack()
-        self.refresh_overlay(); self.overlay.deiconify(); self.make_click_through()
+        if not self.ready_for_position():
+            return
 
-    def refresh_overlay(self):
-        if not (self.overlay and self.overlay.winfo_exists() and self.original_image and self.mid_x is not None and self.screen_x is not None): return
-        s = self.scale.get()
-        w, h = max(1, int(self.original_image.width*s)), max(1, int(self.original_image.height*s))
-        img = self.original_image.resize((w, h), Image.Resampling.LANCZOS)
-        self.overlay_photo = ImageTk.PhotoImage(img)
-        self.overlay_label.configure(image=self.overlay_photo)
-        x = int(self.screen_x - self.mid_x*s)
-        y = int(self.screen_y - self.mid_y*s)
-        self.overlay.geometry(f"{w}x{h}+{x}+{y}")
-        try: self.overlay.attributes("-alpha", self.opacity.get())
-        except tk.TclError: pass
-        self.overlay.lift(); self.make_click_through()
+        if self.screen_x is None or self.screen_y is None:
+            screen = QApplication.primaryScreen().geometry()
+            self.screen_x = screen.x() + screen.width() // 2
+            self.screen_y = screen.y() + screen.height() // 2
 
-    def make_click_through(self):
-        if sys.platform != "win32" or not self.overlay: return
-        try:
-            import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.overlay.winfo_id())
-            GWL_EXSTYLE=-20; WS_EX_LAYERED=0x00080000; WS_EX_TRANSPARENT=0x20; WS_EX_TOOLWINDOW=0x80; WS_EX_NOACTIVATE=0x08000000
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE)
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0,0,0,0, 0x0002|0x0001|0x0010)
-        except Exception: pass
+        self.refresh_overlay()
+        self.overlay.show()
+        self.overlay.raise_()
 
     def hide_overlay(self):
-        if self.overlay and self.overlay.winfo_exists(): self.overlay.withdraw()
+        self.overlay.hide()
+
+    def refresh_overlay(self):
+        if (
+            self.original_image is None
+            or self.mid_x is None
+            or self.mid_y is None
+            or self.screen_x is None
+            or self.screen_y is None
+        ):
+            return
+
+        scale = self.scale_value
+
+        # At exactly 1.0, do not rescale at all.
+        if abs(scale - 1.0) < 1e-9:
+            pixmap = QPixmap.fromImage(self.original_image)
+            new_w = self.original_image.width()
+            new_h = self.original_image.height()
+        else:
+            new_w = max(1, round(self.original_image.width() * scale))
+            new_h = max(1, round(self.original_image.height() * scale))
+
+            pixmap = QPixmap.fromImage(self.original_image).scaled(
+                new_w,
+                new_h,
+                Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation
+            )
+
+        self.overlay.set_overlay_pixmap(pixmap, self.opacity_value)
+
+        mid_scaled_x = self.mid_x * scale
+        mid_scaled_y = self.mid_y * scale
+
+        x = round(self.screen_x - mid_scaled_x)
+        y = round(self.screen_y - mid_scaled_y)
+
+        self.overlay.move(x, y)
 
     def update_status(self):
-        img = os.path.basename(self.image_path) if self.image_path else "None"
-        mid = f"({self.mid_x:.1f}, {self.mid_y:.1f})" if self.mid_x is not None else "Not selected"
-        target = f"({self.screen_x}, {self.screen_y})" if self.screen_x is not None else "Not calibrated"
-        self.status.configure(text=f"Image: {img}\nImage midpoint: {mid}\nScreen target: {target}")
+        image_name = os.path.basename(self.image_path) if self.image_path else "None"
+
+        if self.mid_x is None:
+            midpoint = "Not selected"
+        else:
+            midpoint = f"({self.mid_x:.1f}, {self.mid_y:.1f})"
+
+        if self.screen_x is None:
+            target = "Not calibrated"
+        else:
+            target = f"({self.screen_x}, {self.screen_y})"
+
+        if hasattr(self, "status"):
+            self.status.setText(
+                f"Image: {image_name}\n"
+                f"Image midpoint: {midpoint}\n"
+                f"Screen target: {target}"
+            )
 
     def save_config(self):
-        data = {"image_path": self.image_path, "mid_x": self.mid_x, "mid_y": self.mid_y,
-                "screen_x": self.screen_x, "screen_y": self.screen_y,
-                "scale": self.scale.get(), "opacity": self.opacity.get()}
+        data = {
+            "image_path": self.image_path,
+            "mid_x": self.mid_x,
+            "mid_y": self.mid_y,
+            "screen_x": self.screen_x,
+            "screen_y": self.screen_y,
+            "scale": self.scale_value,
+            "opacity": self.opacity_value
+        }
+
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
-        except Exception: pass
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     def load_config(self):
-        if not os.path.exists(CONFIG_FILE): return
+        if not os.path.exists(CONFIG_FILE):
+            return
+
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f: d=json.load(f)
-            self.image_path=d.get("image_path"); self.mid_x=d.get("mid_x"); self.mid_y=d.get("mid_y")
-            self.screen_x=d.get("screen_x"); self.screen_y=d.get("screen_y")
-            if "scale" in d: self.scale.set(d["scale"])
-            if "opacity" in d: self.opacity.set(d["opacity"])
-        except Exception: pass
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-    def on_close(self):
-        self.save_config(); self.root.destroy()
+            self.image_path = data.get("image_path")
+            self.mid_x = data.get("mid_x")
+            self.mid_y = data.get("mid_y")
+            self.screen_x = data.get("screen_x")
+            self.screen_y = data.get("screen_y")
+            self.scale_value = float(data.get("scale", 1.0))
+            self.opacity_value = float(data.get("opacity", 1.0))
 
-    def run(self): self.root.mainloop()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.save_config()
+        self.overlay.close()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = CrosshairApp()
+    window.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    CrosshairApp().run()
+    main()
