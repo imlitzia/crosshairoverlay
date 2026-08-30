@@ -2,54 +2,40 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QPixmap, QPainter, QImage
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QPainter, QImage, QPen
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog,
     QVBoxLayout, QHBoxLayout, QSlider, QScrollArea, QMessageBox,
-    QFrame
+    QFrame, QSizePolicy
 )
 
 CONFIG_FILE = "crosshair_qt_config.json"
 
 
-class ImagePickerLabel(QLabel):
+class ZoomableImageLabel(QLabel):
     def __init__(self, parent_app):
         super().__init__()
         self.parent_app = parent_app
-        self.setFixedSize(520, 360)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#202020; border:1px solid #666;")
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setStyleSheet("background:#202020;")
         self.setCursor(Qt.CrossCursor)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.LeftButton or self.parent_app.original_image is None:
             return
 
-        if self.parent_app.original_image is None:
+        zoom = self.parent_app.preview_zoom
+        original_x = event.position().x() / zoom
+        original_y = event.position().y() / zoom
+
+        img = self.parent_app.original_image
+        if not (0 <= original_x < img.width() and 0 <= original_y < img.height()):
             return
 
-        pixmap = self.pixmap()
-        if pixmap is None:
-            return
-
-        # Displayed pixmap is centered in this QLabel.
-        px = int((self.width() - pixmap.width()) / 2)
-        py = int((self.height() - pixmap.height()) / 2)
-
-        local_x = event.position().x() - px
-        local_y = event.position().y() - py
-
-        if not (0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height()):
-            return
-
-        original = self.parent_app.original_image
-
-        scale_x = original.width() / pixmap.width()
-        scale_y = original.height() / pixmap.height()
-
-        self.parent_app.mid_x = local_x * scale_x
-        self.parent_app.mid_y = local_y * scale_y
+        self.parent_app.mid_x = float(original_x)
+        self.parent_app.mid_y = float(original_y)
 
         self.parent_app.update_preview()
         self.parent_app.update_status()
@@ -57,60 +43,18 @@ class ImagePickerLabel(QLabel):
         self.parent_app.refresh_overlay()
 
 
-class CalibrationWindow(QWidget):
-    def __init__(self, parent_app):
-        super().__init__(None)
-        self.parent_app = parent_app
-
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-
-        screen = QApplication.primaryScreen()
-        self.setGeometry(screen.geometry())
-
-        self.setCursor(Qt.CrossCursor)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.black)
-        painter.setOpacity(0.65)
-        painter.setPen(Qt.white)
-
-    def mousePressEvent(self, event):
-        global_pos = event.globalPosition()
-
-        self.parent_app.screen_x = int(global_pos.x())
-        self.parent_app.screen_y = int(global_pos.y())
-
-        self.close()
-        self.parent_app.update_status()
-        self.parent_app.save_config()
-        self.parent_app.show_overlay()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
-
-
 class OverlayWindow(QWidget):
     def __init__(self):
         super().__init__(None)
-
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
             | Qt.Tool
             | Qt.WindowTransparentForInput
         )
-
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-
         self.pixmap = None
         self.opacity_value = 1.0
 
@@ -123,34 +67,51 @@ class OverlayWindow(QWidget):
     def paintEvent(self, event):
         if self.pixmap is None:
             return
-
         painter = QPainter(self)
-
-        # High quality composition with true per-pixel alpha.
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.setOpacity(self.opacity_value)
         painter.drawPixmap(0, 0, self.pixmap)
 
 
+class CalibrationWindow(QWidget):
+    def __init__(self, parent_app):
+        super().__init__(None)
+        self.parent_app = parent_app
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setStyleSheet("background: rgba(0,0,0,170);")
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, event):
+        p = event.globalPosition()
+        self.parent_app.screen_x = int(p.x())
+        self.parent_app.screen_y = int(p.y())
+        self.close()
+        self.parent_app.update_status()
+        self.parent_app.save_config()
+        self.parent_app.show_overlay()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class CrosshairApp(QWidget):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle("Custom Image Crosshair - HQ Qt")
-        self.resize(760, 820)
-        self.setMinimumSize(600, 540)
+        self.setWindowTitle("Custom Image Crosshair - Pixel Zoom")
+        self.resize(820, 900)
+        self.setMinimumSize(650, 600)
 
         self.image_path = None
         self.original_image = None
-
         self.mid_x = None
         self.mid_y = None
-
         self.screen_x = None
         self.screen_y = None
 
         self.scale_value = 1.0
         self.opacity_value = 1.0
+        self.preview_zoom = 0.5
 
         self.overlay = OverlayWindow()
         self.calibration_window = None
@@ -162,27 +123,24 @@ class CrosshairApp(QWidget):
             self.load_image(self.image_path)
 
     def build_ui(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
 
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(24, 20, 24, 30)
         layout.setSpacing(12)
 
-        title = QLabel("Custom Image Crosshair — HQ")
+        title = QLabel("Custom Image Crosshair — Pixel Zoom Calibration")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size:24px; font-weight:700;")
         layout.addWidget(title)
 
         info = QLabel(
-            "1. Load a PNG/image\n"
-            "2. Click the exact aiming point inside the image\n"
-            "3. Press Center on Screen\n"
-            "4. Show the overlay\n\n"
-            "This version uses real per-pixel transparency instead of color-key transparency."
+            "Load an image, zoom in until individual pixels are visible, then click the exact point.\n"
+            "The preview zoom is only for calibration and does not change the final overlay size."
         )
-        info.setStyleSheet("font-size:13px;")
+        info.setWordWrap(True)
         layout.addWidget(info)
 
         choose = QPushButton("Choose Crosshair Image")
@@ -190,23 +148,80 @@ class CrosshairApp(QWidget):
         choose.clicked.connect(self.choose_image)
         layout.addWidget(choose)
 
-        self.preview = ImagePickerLabel(self)
-        layout.addWidget(self.preview, alignment=Qt.AlignCenter)
+        zoom_title = QLabel("Calibration Zoom")
+        zoom_title.setStyleSheet("font-size:15px; font-weight:700;")
+        layout.addWidget(zoom_title)
+
+        zoom_row = QHBoxLayout()
+
+        zoom_out = QPushButton("−")
+        zoom_out.setFixedWidth(48)
+        zoom_out.clicked.connect(self.zoom_out)
+
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(10, 1600)
+        self.zoom_slider.setValue(int(self.preview_zoom * 100))
+        self.zoom_slider.valueChanged.connect(self.preview_zoom_changed)
+
+        zoom_in = QPushButton("+")
+        zoom_in.setFixedWidth(48)
+        zoom_in.clicked.connect(self.zoom_in)
+
+        self.zoom_label = QLabel(f"{self.preview_zoom * 100:.0f}%")
+        self.zoom_label.setMinimumWidth(70)
+
+        zoom_row.addWidget(zoom_out)
+        zoom_row.addWidget(self.zoom_slider)
+        zoom_row.addWidget(zoom_in)
+        zoom_row.addWidget(self.zoom_label)
+        layout.addLayout(zoom_row)
+
+        preset_row = QHBoxLayout()
+        presets = [("Fit", None), ("100%", 1.0), ("200%", 2.0), ("400%", 4.0), ("800%", 8.0), ("1600%", 16.0)]
+        for label, value in presets:
+            btn = QPushButton(label)
+            if value is None:
+                btn.clicked.connect(self.fit_preview)
+            else:
+                btn.clicked.connect(lambda checked=False, z=value: self.set_preview_zoom(z))
+            preset_row.addWidget(btn)
+        layout.addLayout(preset_row)
+
+        help_label = QLabel(
+            "At 1600%, each source pixel becomes a 16×16 block. "
+            "Use the horizontal and vertical scrollbars to move around the enlarged image."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color:#555;")
+        layout.addWidget(help_label)
+
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(False)
+        self.preview_scroll.setMinimumHeight(400)
+        self.preview_scroll.setStyleSheet("QScrollArea { background:#202020; border:1px solid #666; }")
+
+        self.preview = ZoomableImageLabel(self)
+        self.preview_scroll.setWidget(self.preview)
+        layout.addWidget(self.preview_scroll)
+
+        self.pixel_status = QLabel("Click the image to select the exact calibration point.")
+        self.pixel_status.setStyleSheet("font-weight:600;")
+        self.pixel_status.setWordWrap(True)
+        layout.addWidget(self.pixel_status)
 
         self.status = QLabel("Load an image to begin.")
-        self.status.setStyleSheet("font-size:13px;")
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         layout.addWidget(line)
 
-        scale_text = QLabel("Overlay scale")
-        scale_text.setStyleSheet("font-weight:600;")
-        layout.addWidget(scale_text)
+        final_title = QLabel("Final Overlay Scale")
+        final_title.setStyleSheet("font-weight:700;")
+        layout.addWidget(final_title)
 
         scale_row = QHBoxLayout()
-
         self.scale_slider = QSlider(Qt.Horizontal)
         self.scale_slider.setRange(5, 300)
         self.scale_slider.setValue(int(self.scale_value * 100))
@@ -219,23 +234,15 @@ class CrosshairApp(QWidget):
         scale_row.addWidget(self.scale_label)
         layout.addLayout(scale_row)
 
-        pixel_btn = QPushButton("Pixel-Perfect 1:1")
+        pixel_btn = QPushButton("Pixel-Perfect Final Overlay 1:1")
         pixel_btn.clicked.connect(self.pixel_perfect)
         layout.addWidget(pixel_btn)
 
-        quality_note = QLabel(
-            "1.00× = exact source pixels, with no resizing.\n"
-            "Below 1.00× = image is downscaled, but Qt uses high-quality filtering."
-        )
-        quality_note.setStyleSheet("color:#666;")
-        layout.addWidget(quality_note)
-
-        opacity_text = QLabel("Opacity")
-        opacity_text.setStyleSheet("font-weight:600;")
-        layout.addWidget(opacity_text)
+        opacity_title = QLabel("Opacity")
+        opacity_title.setStyleSheet("font-weight:700;")
+        layout.addWidget(opacity_title)
 
         opacity_row = QHBoxLayout()
-
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(10, 100)
         self.opacity_slider.setValue(int(self.opacity_value * 100))
@@ -248,12 +255,7 @@ class CrosshairApp(QWidget):
         opacity_row.addWidget(self.opacity_label)
         layout.addLayout(opacity_row)
 
-        position_title = QLabel("Screen Position")
-        position_title.setStyleSheet("font-size:15px; font-weight:700;")
-        layout.addWidget(position_title)
-
-        position_row = QHBoxLayout()
-
+        pos_row = QHBoxLayout()
         center_btn = QPushButton("Center on Screen")
         center_btn.setMinimumHeight(42)
         center_btn.clicked.connect(self.center_on_screen)
@@ -262,38 +264,29 @@ class CrosshairApp(QWidget):
         manual_btn.setMinimumHeight(42)
         manual_btn.clicked.connect(self.manual_calibration)
 
-        position_row.addWidget(center_btn)
-        position_row.addWidget(manual_btn)
-        layout.addLayout(position_row)
+        pos_row.addWidget(center_btn)
+        pos_row.addWidget(manual_btn)
+        layout.addLayout(pos_row)
 
         overlay_row = QHBoxLayout()
-
         show_btn = QPushButton("Show Overlay")
         show_btn.setMinimumHeight(42)
         show_btn.clicked.connect(self.show_overlay)
 
         hide_btn = QPushButton("Hide Overlay")
         hide_btn.setMinimumHeight(42)
-        hide_btn.clicked.connect(self.hide_overlay)
+        hide_btn.clicked.connect(self.overlay.hide)
 
         overlay_row.addWidget(show_btn)
         overlay_row.addWidget(hide_btn)
         layout.addLayout(overlay_row)
 
-        tip = QLabel(
-            "Best quality: use a transparent PNG and keep scale at 1.00×.\n"
-            "If you want the character smaller without losing edge quality, use a large original PNG."
-        )
-        tip.setStyleSheet("color:#555;")
-        layout.addWidget(tip)
-
         layout.addStretch()
-
-        scroll.setWidget(body)
+        outer.setWidget(body)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(scroll)
+        root.addWidget(outer)
 
         self.update_status()
 
@@ -304,68 +297,133 @@ class CrosshairApp(QWidget):
             "",
             "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
         )
-
         if not path:
             return
 
         self.image_path = path
         self.mid_x = None
         self.mid_y = None
-
         self.load_image(path)
         self.save_config()
 
     def load_image(self, path):
         image = QImage(path)
-
         if image.isNull():
             QMessageBox.critical(self, "Error", "Could not load the selected image.")
             return
 
-        # Preserve the original ARGB pixels, including alpha.
         self.original_image = image.convertToFormat(QImage.Format_ARGB32)
-
+        self.fit_preview()
         self.update_preview()
         self.update_status()
+
+    def set_preview_zoom(self, zoom):
+        zoom = max(0.10, min(16.0, float(zoom)))
+        self.preview_zoom = zoom
+
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(round(zoom * 100))
+        self.zoom_slider.blockSignals(False)
+
+        self.zoom_label.setText(f"{zoom * 100:.0f}%")
+        self.update_preview()
+
+    def preview_zoom_changed(self, value):
+        self.preview_zoom = value / 100.0
+        self.zoom_label.setText(f"{value}%")
+        self.update_preview()
+
+    def zoom_in(self):
+        self.set_preview_zoom(self.preview_zoom * 1.25)
+
+    def zoom_out(self):
+        self.set_preview_zoom(self.preview_zoom / 1.25)
+
+    def fit_preview(self):
+        if self.original_image is None:
+            return
+
+        viewport = self.preview_scroll.viewport().size()
+        available_w = max(100, viewport.width() - 12)
+        available_h = max(100, viewport.height() - 12)
+
+        fit_zoom = min(
+            available_w / self.original_image.width(),
+            available_h / self.original_image.height(),
+            1.0
+        )
+        self.set_preview_zoom(max(0.10, fit_zoom))
 
     def update_preview(self):
         if self.original_image is None:
             return
 
-        preview_pixmap = QPixmap.fromImage(self.original_image)
+        zoom = self.preview_zoom
+        w = max(1, round(self.original_image.width() * zoom))
+        h = max(1, round(self.original_image.height() * zoom))
 
-        preview_pixmap = preview_pixmap.scaled(
-            500,
-            340,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
+        source = QPixmap.fromImage(self.original_image)
+
+        # Nearest-neighbor above 100% so original pixels are easy to inspect.
+        mode = Qt.FastTransformation if zoom >= 1.0 else Qt.SmoothTransformation
+
+        displayed = source.scaled(w, h, Qt.IgnoreAspectRatio, mode)
 
         if self.mid_x is not None and self.mid_y is not None:
-            marked = QPixmap(preview_pixmap)
+            marked = QPixmap(displayed)
             painter = QPainter(marked)
-            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setRenderHint(QPainter.Antialiasing, False)
 
-            scale_x = preview_pixmap.width() / self.original_image.width()
-            scale_y = preview_pixmap.height() / self.original_image.height()
+            x = self.mid_x * zoom
+            y = self.mid_y * zoom
 
-            x = self.mid_x * scale_x
-            y = self.mid_y * scale_y
-
-            pen = painter.pen()
-            pen.setColor(Qt.red)
+            pen = QPen(Qt.red)
             pen.setWidth(2)
             painter.setPen(pen)
 
-            r = 10
-            painter.drawEllipse(QPoint(int(x), int(y)), r, r)
-            painter.drawLine(int(x - 18), int(y), int(x + 18), int(y))
-            painter.drawLine(int(x), int(y - 18), int(x), int(y + 18))
+            # At 400%+, draw a box around the exact selected source pixel.
+            if zoom >= 4.0:
+                px = int(self.mid_x)
+                py = int(self.mid_y)
+                painter.drawRect(
+                    round(px * zoom),
+                    round(py * zoom),
+                    max(1, round(zoom)),
+                    max(1, round(zoom))
+                )
+
+            cross = 14
+            painter.drawLine(round(x - cross), round(y), round(x + cross), round(y))
+            painter.drawLine(round(x), round(y - cross), round(x), round(y + cross))
             painter.end()
+            displayed = marked
 
-            preview_pixmap = marked
+        self.preview.setPixmap(displayed)
+        self.preview.setFixedSize(w, h)
+        self.update_pixel_status()
 
-        self.preview.setPixmap(preview_pixmap)
+    def update_pixel_status(self):
+        if not hasattr(self, "pixel_status"):
+            return
+
+        if self.original_image is None:
+            self.pixel_status.setText("No image loaded.")
+            return
+
+        if self.mid_x is None or self.mid_y is None:
+            self.pixel_status.setText(
+                f"Zoom: {self.preview_zoom * 100:.0f}% — click the image to select a point."
+            )
+            return
+
+        px = max(0, min(self.original_image.width() - 1, int(self.mid_x)))
+        py = max(0, min(self.original_image.height() - 1, int(self.mid_y)))
+
+        self.pixel_status.setText(
+            f"Selected source pixel: X={px}, Y={py}   |   "
+            f"Precise point: ({self.mid_x:.3f}, {self.mid_y:.3f})   |   "
+            f"Zoom: {self.preview_zoom * 100:.0f}%"
+        )
 
     def scale_changed(self, value):
         self.scale_value = value / 100.0
@@ -380,17 +438,13 @@ class CrosshairApp(QWidget):
         self.save_config()
 
     def pixel_perfect(self):
-        self.scale_value = 1.0
         self.scale_slider.setValue(100)
-        self.refresh_overlay()
-        self.save_config()
 
     def center_on_screen(self):
-        if not self.ready_for_position():
+        if not self.ready():
             return
 
         screen = QApplication.primaryScreen().geometry()
-
         self.screen_x = screen.x() + screen.width() // 2
         self.screen_y = screen.y() + screen.height() // 2
 
@@ -399,16 +453,15 @@ class CrosshairApp(QWidget):
         self.show_overlay()
 
     def manual_calibration(self):
-        if not self.ready_for_position():
+        if not self.ready():
             return
 
-        self.hide_overlay()
-
+        self.overlay.hide()
         self.calibration_window = CalibrationWindow(self)
         self.calibration_window.showFullScreen()
         self.calibration_window.activateWindow()
 
-    def ready_for_position(self):
+    def ready(self):
         if self.original_image is None:
             QMessageBox.information(self, "No image", "Choose an image first.")
             return False
@@ -417,14 +470,14 @@ class CrosshairApp(QWidget):
             QMessageBox.information(
                 self,
                 "Set midpoint",
-                "Click the desired aiming point inside the image first."
+                "Zoom into the image and click the desired aiming point first."
             )
             return False
 
         return True
 
     def show_overlay(self):
-        if not self.ready_for_position():
+        if not self.ready():
             return
 
         if self.screen_x is None or self.screen_y is None:
@@ -435,9 +488,6 @@ class CrosshairApp(QWidget):
         self.refresh_overlay()
         self.overlay.show()
         self.overlay.raise_()
-
-    def hide_overlay(self):
-        self.overlay.hide()
 
     def refresh_overlay(self):
         if (
@@ -451,51 +501,40 @@ class CrosshairApp(QWidget):
 
         scale = self.scale_value
 
-        # At exactly 1.0, do not rescale at all.
         if abs(scale - 1.0) < 1e-9:
             pixmap = QPixmap.fromImage(self.original_image)
-            new_w = self.original_image.width()
-            new_h = self.original_image.height()
         else:
-            new_w = max(1, round(self.original_image.width() * scale))
-            new_h = max(1, round(self.original_image.height() * scale))
-
+            w = max(1, round(self.original_image.width() * scale))
+            h = max(1, round(self.original_image.height() * scale))
             pixmap = QPixmap.fromImage(self.original_image).scaled(
-                new_w,
-                new_h,
-                Qt.IgnoreAspectRatio,
-                Qt.SmoothTransformation
+                w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
             )
 
         self.overlay.set_overlay_pixmap(pixmap, self.opacity_value)
-
-        mid_scaled_x = self.mid_x * scale
-        mid_scaled_y = self.mid_y * scale
-
-        x = round(self.screen_x - mid_scaled_x)
-        y = round(self.screen_y - mid_scaled_y)
-
-        self.overlay.move(x, y)
+        self.overlay.move(
+            round(self.screen_x - self.mid_x * scale),
+            round(self.screen_y - self.mid_y * scale)
+        )
 
     def update_status(self):
-        image_name = os.path.basename(self.image_path) if self.image_path else "None"
-
-        if self.mid_x is None:
-            midpoint = "Not selected"
-        else:
-            midpoint = f"({self.mid_x:.1f}, {self.mid_y:.1f})"
-
-        if self.screen_x is None:
-            target = "Not calibrated"
-        else:
-            target = f"({self.screen_x}, {self.screen_y})"
+        name = os.path.basename(self.image_path) if self.image_path else "None"
+        point = (
+            f"({self.mid_x:.3f}, {self.mid_y:.3f})"
+            if self.mid_x is not None
+            else "Not selected"
+        )
+        target = (
+            f"({self.screen_x}, {self.screen_y})"
+            if self.screen_x is not None
+            else "Not calibrated"
+        )
 
         if hasattr(self, "status"):
             self.status.setText(
-                f"Image: {image_name}\n"
-                f"Image midpoint: {midpoint}\n"
-                f"Screen target: {target}"
+                f"Image: {name}\nCalibration point: {point}\nScreen target: {target}"
             )
+
+        self.update_pixel_status()
 
     def save_config(self):
         data = {
@@ -505,9 +544,9 @@ class CrosshairApp(QWidget):
             "screen_x": self.screen_x,
             "screen_y": self.screen_y,
             "scale": self.scale_value,
-            "opacity": self.opacity_value
+            "opacity": self.opacity_value,
+            "preview_zoom": self.preview_zoom,
         }
-
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -529,7 +568,10 @@ class CrosshairApp(QWidget):
             self.screen_y = data.get("screen_y")
             self.scale_value = float(data.get("scale", 1.0))
             self.opacity_value = float(data.get("opacity", 1.0))
-
+            self.preview_zoom = max(
+                0.10,
+                min(16.0, float(data.get("preview_zoom", 0.5)))
+            )
         except Exception:
             pass
 
